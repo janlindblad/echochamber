@@ -23,9 +23,9 @@ class BlueSkyBot(Thread):
         self.hostname = hostname
         self.handle   = handle
         self.stop = False
-        self.muted_users = []
         self.convo = {}
-        self.follower_names = {}
+        self.followers = {}
+        self.muted_users = self.read_muted_users()
         self.connect()
         log.info(f"BlueSkyBot connected to {self.hostname} with handle {self.handle} did {self.did}")
         self.inform_about_followers()
@@ -99,12 +99,12 @@ class BlueSkyBot(Thread):
                 if isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogBeginConvo):
                     # When someone starts a conversation
                     log.info(f"Received LogBeginConvo event {event}")
-                    self.update_follower_names()
+                    self.update_followers()
                     continue
                 elif isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogLeaveConvo):
                     # When someone leaves a conversation? Never seen
                     log.info(f"Received LogLeaveConvo event {event}")
-                    self.update_follower_names()
+                    self.update_followers()
                     continue
                 elif event.message.sender.did == self.did:
                     log.debug(f"Echo of own message {event.message.sender.did}: {event.message.text}")
@@ -117,40 +117,50 @@ class BlueSkyBot(Thread):
     log.info("Terminating.")
 
     def handle_command(self, sender_did, text):
-        if text.startswith("/help"):
-            self.handle_help_command(sender_did)
+        try:
+            if not text.startswith("/"):
+                return False
+            words = text.split(" ")
+            if   words[0] == "/help":     self.handle_help_command(sender_did)
+            elif words[0] == "/shutdown": self.queue.put(ShutdownMsg())
+            elif words[0] == "/who":      self.handle_who_command(sender_did)
+            elif words[0] == "/who-is":   self.handle_whois_command(words[1:], sender_did)
+            elif words[0] == "/mute":     self.handle_mute_command(words[1:], sender_did)
+            elif words[0] == "/muted":    self.handle_muted_command(sender_did)
+            else:
+                self.tell_one_user(sender_did, "Admin command not understood.")
             return True
-        if text.startswith("/shutdown"):
-            self.queue.put(ShutdownMsg())
+        except Exception as e:
+            log.error(f"Admin command failed, {e}")
+            self.tell_one_user(sender_did, f"Admin command failed.")
             return True
-        if text.startswith("/who"):
-            self.update_follower_names()
-            self.handle_who_command(sender_did)
-            return True
-        return False
 
     def handle_help_command(self, sender_did):
         self.tell_one_user(
             sender_did, 
             f"""Admin commands:
-            /help      List admin commands
-            /who       List users in this Echo chamber
-            /shutdown  Shut down all Echo chambers managed by this process
+/help          List admin commands
+/who           List users in this Echo chamber
+/who-is <user> Show details about user with handle
+/mute <did>    Add user did to muted users list
+/muted         List muted users
+/shutdown      Shut down all Echo chambers managed by this process
             """
         )
 
     def handle_who_command(self, sender_did):
+        self.update_followers()
         other_follower_names = ", ".join(
-            [self.follower_names[follower_did] 
-                for follower_did in self.follower_names.keys() 
+            [self.get_follower_name(follower_did)
+                for follower_did in self.followers.keys() 
                 if follower_did != sender_did]
         )
-        if len(self.follower_names) >= 3:
+        if len(self.followers) >= 3:
             self.tell_one_user(
                 sender_did, 
-                f"There are {len(self.follower_names)-1} other members in this Echo chamber: {other_follower_names}"
+                f"There are {len(self.followers)-1} other members in this Echo chamber: {other_follower_names}"
             )
-        elif len(self.follower_names) == 2:
+        elif len(self.followers) == 2:
             self.tell_one_user(
                 sender_did, 
                 f"There is one other member in this Echo chamber: {other_follower_names}"
@@ -161,26 +171,84 @@ class BlueSkyBot(Thread):
                 f"There are no other members in this Echo chamber."
             )
 
+    def handle_whois_command(self, words, sender_did):
+        count_matching_users = 0
+        for follower in self.followers.values():
+            for word in words:
+                if  word in follower.did or \
+                    word in follower.handle or \
+                    word in follower.display_name:
+                    count_matching_users += 1
+                    self.show_user_details(follower, sender_did)
+        if not count_matching_users:
+            self.tell_one_user(sender_did, f"No matching users found.")
+
+    def show_user_details(self, follower, sender_did):
+        self.tell_one_user(
+            sender_did, 
+            f"{follower.display_name} ({follower.handle}) {follower.did}"
+        )
+
+    def handle_muted_command(self, sender_did):
+        self.tell_one_user(sender_did, f"""Muted users: {", ".join(self.muted_users)}""")
+
+    def handle_mute_command(self, target_dids, sender_did):
+        for target_did in target_dids:
+            self.mute_user(target_did, sender_did)
+        self.handle_muted_command(sender_did)
+
     def tell_room_users(self, sender_did, text):
-        self.update_follower_names()
-        from_name = self.follower_names.get(sender_did, f"Anonymous {sender_did}")
-        for member_did in self.follower_names.keys():
+        self.update_followers()
+        if sender_did in self.muted_users:
+            log.info(f"Muted user {sender_did} is trying to post. Rejected.")
+            return
+        from_name = self.get_follower_name(sender_did, f"Anonymous {sender_did}")
+        for member_did in self.followers:
             if member_did == sender_did:
                 continue
             self.tell_one_user(member_did, f"{from_name}: {text}")
 
-    def update_follower_names(self):
-        followers = self.list_followers()
-        self.follower_names = {f.did: f.display_name if f.display_name else f.handle for f in followers}
+    def get_follower_name(self, did, default_name = None):
+        return self.get_follower_names().get(did, default_name)
+
+    def get_follower_names(self):
+        return {f.did: f.display_name if f.display_name else f.handle for f in self.followers.values()}
+
+    def update_followers(self):
+        self.followers = {follower.did:follower for follower in self.list_followers()}
 
     def inform_about_followers(self):
-        self.update_follower_names()
-        if not self.follower_names:
+        self.update_followers()
+        if not self.followers:
             log.info("No followers")
             return
         log.info(f"BlueSkyBot {self.handle} has followers:")
-        for n, did in enumerate(self.follower_names.keys()):
-            log.info(f"Follower #{n}: {self.follower_names[did]}")
+        for n, did in enumerate(self.followers.keys()):
+            log.info(f"Follower #{n}: {did} {self.followers[did].display_name} ({self.followers[did].handle}) {self.followers[did]}")
+
+    def get_muted_users_filename(self):
+        datadir = os.environ.get("ECHOCHAMBER_DATADIR", ".")
+        filename = f"{datadir}/muted_users.txt"
+        return filename
+
+    def read_muted_users(self):
+        muted_users = set()
+        filename = self.get_muted_users_filename()
+        with open(filename, "r") as f:
+            self.muted_users = []
+            for didstr in f.readlines():
+                did = didstr.strip()
+                if did and did[0] != "#":
+                    muted_users.add(did)
+        log.info(f"""Muted users: {", ".join(muted_users)}""")
+        return muted_users
+
+    def mute_user(self, target_did, issuer_did):
+        filename = self.get_muted_users_filename()
+        self.muted_users.add(target_did)
+        with open(filename, "a") as f:
+            print(f"# User {issuer_did} muted {target_did} on {time.ctime()}\n{target_did}", file=f)
+        log.info(f"{issuer_did} muted user {target_did}")
 
     def list_followers(self):
         cursor = 1
@@ -192,7 +260,7 @@ class BlueSkyBot(Thread):
 
             batchdata = reply.followers
             for follower in batchdata:
-                if follower not in self.muted_users:
+                if follower.did not in self.muted_users:
                     yield follower
             cursor = reply.cursor
 
