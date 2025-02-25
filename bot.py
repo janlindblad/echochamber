@@ -138,15 +138,14 @@ class BlueSkyBot(Thread):
     def handle_help_command(self, sender_did):
         self.tell_one_user(
             sender_did, 
+            # Indentation designed to look good in BlueSky web interface
             f"""Admin commands:
-/help          List admin commands
-/who           List users in this Echo chamber
-/who-is <user> Show details about user with handle
-/mute <did>    Add user did to muted users list
-/muted         List muted users
-/shutdown      Shut down all Echo chambers managed by this process
-            """
-        )
+/help                    List admin commands
+/who                    List users in this Echo chamber
+/who-is <user>  Show details about <user>
+/mute <did>       Mute user with id <did>
+/muted                List muted users
+/shutdown          Shut down Echo chamber server""")
 
     def handle_who_command(self, sender_did):
         self.update_followers()
