@@ -6,9 +6,21 @@
 
 import os, time, logging
 from threading import Thread, get_ident
-from atproto import Client, models, IdResolver
+from atproto import Client, models, IdResolver, client_utils
+import atproto_client.exceptions
 import atproto_client, atproto_server
+import pydantic_core
 from msgs import ShutdownMsg
+
+# FIXME
+# patched ...python.../site-packages/atproto_client/models/chat/bsky/convo/get_log.py
+# class Response(base.ResponseModelBase):
+# ...
+#    logs: t.List[
+#        te.Annotated[
+#            t.Union[
+# ...
+#                 'models.ChatBskyConvoDefs.LogReadMessage', # FIXME JANL
 
 log = logging.getLogger("echochamber.bot")
 
@@ -84,7 +96,11 @@ class BlueSkyBot(Thread):
                 time.sleep(60)
                 self.connect()
                 continue
-            except:
+            except atproto_client.exceptions.ModelError as e:
+                log.exception(f"Pydantic validation exception") #, exc_info=e)
+                continue
+            except Exception as e:
+                log.exception(f"Other bsky exception", exc_info=e)
                 if bsky_retries >= 3:
                     log.error(f"Unable to get message log, {bsky_retries} retries")
                     raise Exception("BSKY Unable to get message log")
@@ -99,11 +115,13 @@ class BlueSkyBot(Thread):
                 if isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogBeginConvo):
                     # When someone starts a conversation
                     log.info(f"Received LogBeginConvo event {event}")
+                    #log.info(f"Event details {event.__dict__}")
                     self.update_followers()
                     continue
                 elif isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogLeaveConvo):
                     # When someone leaves a conversation? Never seen
                     log.info(f"Received LogLeaveConvo event {event}")
+                    #log.info(f"Event details {event.__dict__}")
                     self.update_followers()
                     continue
                 elif event.message.sender.did == self.did:
@@ -111,7 +129,8 @@ class BlueSkyBot(Thread):
                     continue
                 log.info(f"Message from {event.message.sender.did}: {event.message.text}")
                 if not self.handle_command(event.message.sender.did, event.message.text):
-                    self.tell_room_users(event.message.sender.did, event.message.text)
+                    log.info(f"Facet details {event.message.facets}")
+                    self.tell_room_users(event.message.sender.did, event.message)
             # Polling interval
             time.sleep(15)
     log.info("Terminating.")
@@ -196,7 +215,7 @@ class BlueSkyBot(Thread):
             self.mute_user(target_did, sender_did)
         self.handle_muted_command(sender_did)
 
-    def tell_room_users(self, sender_did, text):
+    def tell_room_users(self, sender_did, rich_message):
         self.update_followers()
         if sender_did in self.muted_users:
             log.info(f"Muted user {sender_did} is trying to post. Rejected.")
@@ -205,7 +224,10 @@ class BlueSkyBot(Thread):
         for member_did in self.followers:
             if member_did == sender_did:
                 continue
-            self.tell_one_user(member_did, f"{from_name}: {text}")
+            message_builder = client_utils.TextBuilder()
+            message_builder.text(f"{from_name}: ")
+            self.recompose(message_builder, rich_message)
+            self.tell_one_user(member_did, message_builder)
 
     def get_follower_name(self, did, default_name = None):
         return self.get_follower_names().get(did, default_name)
@@ -263,14 +285,21 @@ class BlueSkyBot(Thread):
                     yield follower
             cursor = reply.cursor
 
-    def tell_one_user(self, user, text_message):
-        log.info(f"Telling {user} {text_message}")
+    def tell_one_user(self, user, message):
+        if isinstance(message, str):
+            message_text = message
+            message_facets = None
+        else:
+            message_text = message.build_text()
+            message_facets = message.build_facets()
+        log.info(f"Telling {user} {message_text}")
         convo = self.get_user_convo(user)
         self.dm_client.chat.bsky.convo.send_message(
             models.ChatBskyConvoSendMessage.Data(
                 convo_id=convo.id,
                 message=models.ChatBskyConvoDefs.MessageInput(
-                    text=text_message,
+                    text=message_text,
+                    facets=message_facets,
                 ),
             )
         )
@@ -282,3 +311,38 @@ class BlueSkyBot(Thread):
             models.ChatBskyConvoGetConvoForMembers.Params(members=[self.did, did]),
         ).convo
         return self.convo[did]
+
+    def recompose(self, message_builder, rich_message):
+        log.info(f"Recompose {rich_message}")
+        # facets = [Main(features=[Link(uri='https://8.8.8.8/foo', py_type='app.bsky.richtext.facet#link')])]
+        byte_offs = 0
+        if rich_message.facets:
+            for i, fac in enumerate(rich_message.facets):
+                log.info(f"Facet {i}: {fac}")
+                if isinstance(fac, atproto_client.models.AppBskyRichtextFacet.Main):
+                    if fac.index.byte_start > byte_offs:
+                        text_only_slice = rich_message.text[byte_offs:fac.index.byte_start]
+                        log.info(f"  Text: {text_only_slice}")
+                        message_builder.text(text_only_slice)
+                        byte_offs = fac.index.byte_end
+                    substr = rich_message.text[fac.index.byte_start:fac.index.byte_end]
+                    for i, feat in enumerate(fac.features):
+                        log.info(f"  Feature {i}: {feat}")
+                        byte_offs = fac.index.byte_end
+                        if isinstance(feat, atproto_client.models.AppBskyRichtextFacet.Link):
+                            log.info(f"  Link: {feat} {feat.uri}")
+                            message_builder.link(substr, feat.uri)
+                        elif isinstance(feat, atproto_client.models.AppBskyRichtextFacet.Mention):
+                            log.info(f"  Mention: {feat} {feat.did}")
+                            message_builder.mention(substr, feat.did)
+                        elif isinstance(feat, atproto_client.models.AppBskyRichtextFacet.Tag):
+                            log.info(f"  Tag: {feat} {feat.tag}")
+                            message_builder.tag(substr, feat.tag)
+                        else:
+                            log.warning(f"Feature type unknown, ignored {i}: {fac} {feat}")
+                else:
+                    log.warning(f"Facet type unknown, ignored {i}: {fac}")
+        if len(rich_message.text) > byte_offs:
+            text_only_slice = rich_message.text[byte_offs:]
+            log.info(f"  Final Text: {text_only_slice}")
+            message_builder.text(text_only_slice)
