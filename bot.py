@@ -38,6 +38,7 @@ class BlueSkyBot(Thread):
         self.convo = {}
         self.followers = {}
         self.muted_users = self.read_muted_users()
+        self.recently_processed_messages = set() # FIXME occasionally prune this set
         self.connect()
         log.info(f"BlueSkyBot connected to {self.hostname} with handle {self.handle} did {self.did}")
         self.inform_about_followers()
@@ -121,6 +122,7 @@ class BlueSkyBot(Thread):
                 elif isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogLeaveConvo):
                     # When someone leaves a conversation? Never seen
                     log.info(f"Received LogLeaveConvo event {event}")
+                    # Event details {'convo_id': '3lirhhlpv5a2h', 'rev': '222222335esrd', 'py_type': 'chat.bsky.convo.defs#logLeaveConvo'}
                     #log.info(f"Event details {event.__dict__}")
                     self.update_followers()
                     continue
@@ -128,6 +130,11 @@ class BlueSkyBot(Thread):
                     log.debug(f"Echo of own message {event.message.sender.did}: {event.message.text}")
                     continue
                 log.info(f"Message from {event.message.sender.did}: {event.message.text}")
+                # atproto_client.models.chat.bsky.convo.defs.MessageView
+                if event.message.id in self.recently_processed_messages:
+                    log.info(f"Duplicate message {event.message.id}, ignoring")
+                    continue
+                self.recently_processed_messages.add(event.message.id)
                 if not self.handle_command(event.message.sender.did, event.message.text):
                     log.info(f"Facet details {event.message.facets}")
                     self.tell_room_users(event.message.sender.did, event.message)
@@ -315,19 +322,19 @@ class BlueSkyBot(Thread):
     def recompose(self, message_builder, rich_message):
         log.info(f"Recompose {rich_message}")
         # facets = [Main(features=[Link(uri='https://8.8.8.8/foo', py_type='app.bsky.richtext.facet#link')])]
+        byte_str  = bytearray(rich_message.text, encoding="utf-8")
         byte_offs = 0
         if rich_message.facets:
             for i, fac in enumerate(rich_message.facets):
                 log.info(f"Facet {i}: {fac}")
                 if isinstance(fac, atproto_client.models.AppBskyRichtextFacet.Main):
                     if fac.index.byte_start > byte_offs:
-                        text_only_slice = rich_message.text[byte_offs:fac.index.byte_start]
+                        text_only_slice = byte_str[byte_offs:fac.index.byte_start].decode("utf-8")
                         log.info(f"  Text: {text_only_slice}")
                         message_builder.text(text_only_slice)
                         byte_offs = fac.index.byte_end
-                    substr = rich_message.text[fac.index.byte_start:fac.index.byte_end]
+                    substr = byte_str[fac.index.byte_start:fac.index.byte_end].decode("utf-8")
                     for i, feat in enumerate(fac.features):
-                        log.info(f"  Feature {i}: {feat}")
                         byte_offs = fac.index.byte_end
                         if isinstance(feat, atproto_client.models.AppBskyRichtextFacet.Link):
                             log.info(f"  Link: {feat} {feat.uri}")
@@ -337,12 +344,12 @@ class BlueSkyBot(Thread):
                             message_builder.mention(substr, feat.did)
                         elif isinstance(feat, atproto_client.models.AppBskyRichtextFacet.Tag):
                             log.info(f"  Tag: {feat} {feat.tag}")
-                            message_builder.tag(substr, feat.tag)
+                            message_builder.tag(str(substr), feat.tag)
                         else:
                             log.warning(f"Feature type unknown, ignored {i}: {fac} {feat}")
                 else:
                     log.warning(f"Facet type unknown, ignored {i}: {fac}")
         if len(rich_message.text) > byte_offs:
-            text_only_slice = rich_message.text[byte_offs:]
+            text_only_slice = byte_str[byte_offs:].decode("utf-8")
             log.info(f"  Final Text: {text_only_slice}")
             message_builder.text(text_only_slice)
