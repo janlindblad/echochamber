@@ -5,4 +5,12 @@
 # See LICENSE for license conditions
 
 class ShutdownMsg:
-    ...
+    def __init__(self, handle):
+        self.handle = handle
+
+class StartupMsg:
+    def __init__(self, handle, username, password, hostname):
+        self.handle   = handle
+        self.username = username
+        self.password = password
+        self.hostname = hostname

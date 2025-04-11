@@ -9,7 +9,8 @@ from threading import Thread
 from queue import Queue
 from dotenv import load_dotenv
 from bot import BlueSkyBot
-from msgs import ShutdownMsg
+from msgs import ShutdownMsg, StartupMsg
+from chambers import Chambers
 
 # Load environment variables
 load_dotenv()
@@ -74,23 +75,33 @@ class Hourglass(Thread):
 
 def handle_admin_msgs(queue):
     while True:
+        if not BlueSkyBot.get_bot_count():
+            log.info("All echochambers have shutdown, terminating")
+            break
         msg = queue.get()
         if isinstance(msg, ShutdownMsg):
-            break
+            Chambers.delete(msg.handle)
+        if isinstance(msg, StartupMsg):
+            Chambers.create(msg)        
 
 def main():
     setup_logging()
     log.info(f"\n\n### Echochamber starting on {time.ctime()}")
-    admin_msg_queue = Queue()
-    username = os.getenv("BLUESKY_USERNAME")
-    password = os.getenv("BLUESKY_PASSWORD")
-    hostname = os.getenv("BLUESKY_HOSTNAME")
-    handle   = os.getenv("BLUESKY_HANDLE")
-    BlueSkyBot(admin_msg_queue, username, password, hostname, handle).start()
+
+    super_admin_msg_queue = Queue()
+    chambers = Chambers.get_definitions()
+    for handle in chambers.keys():
+        try:
+            username = chambers[handle]['username']
+            app_password = chambers[handle]['app_password']
+            hostname = chambers[handle]['hostname']
+            BlueSkyBot(super_admin_msg_queue, handle, username, app_password, hostname).start()
+        except Exception as e:
+            log.exception(f"Could not create echochamber {handle}, skipping", exc_info=e)
 
     log.info(f"### Echochamber listening on {time.ctime()}")
     print("Listening...")
-    handle_admin_msgs(admin_msg_queue)
+    handle_admin_msgs(super_admin_msg_queue)
     log.info(f"### Echochamber terminating on {time.ctime()}")
 
 if __name__ == "__main__":

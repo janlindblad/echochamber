@@ -1,4 +1,4 @@
-# Echo chamber
+# Echochamber
 #   - Group chats for BlueSky
 #
 # (C) 2025 All For Eco AB, Jan Lindblad
@@ -9,7 +9,6 @@ from threading import Thread, get_ident
 from atproto import Client, models, IdResolver, client_utils
 import atproto_client.exceptions
 import atproto_client, atproto_server
-import pydantic_core
 from msgs import ShutdownMsg
 
 # FIXME
@@ -27,7 +26,11 @@ log = logging.getLogger("echochamber.bot")
 class BlueSkyBot(Thread):
     running_bots = {}
 
-    def __init__(self, queue, username, password, hostname, handle):
+    @staticmethod
+    def get_bot_count():
+        return len(BlueSkyBot.running_bots)
+
+    def __init__(self, queue, handle, username, password, hostname):
         super().__init__()
         self.queue = queue
         self.username = username
@@ -37,6 +40,7 @@ class BlueSkyBot(Thread):
         self.stop = False
         self.convo = {}
         self.followers = {}
+        self.communicated_followers = {}
         self.muted_users = self.read_muted_users()
         self.recently_processed_messages = set() # FIXME occasionally prune this set
         self.connect()
@@ -129,7 +133,10 @@ class BlueSkyBot(Thread):
                 elif event.message.sender.did == self.did:
                     log.debug(f"Echo of own message {event.message.sender.did}: {event.message.text}")
                     continue
-                log.info(f"Message from {event.message.sender.did}: {event.message.text}")
+                if event.message.text.strip().startswith("/"):
+                    log.info(f"Admin command from {event.message.sender.did}")
+                else:
+                    log.info(f"Message from {event.message.sender.did}: {event.message.text}")
                 # atproto_client.models.chat.bsky.convo.defs.MessageView
                 if event.message.id in self.recently_processed_messages:
                     log.info(f"Duplicate message {event.message.id}, ignoring")
@@ -137,21 +144,23 @@ class BlueSkyBot(Thread):
                 self.recently_processed_messages.add(event.message.id)
                 if not self.handle_command(event.message.sender.did, event.message.text):
                     log.info(f"Facet details {event.message.facets}")
+                    self.update_followers()
+                    self.tell_room_about_follower_changes()
                     self.tell_room_users(event.message.sender.did, event.message)
             # Polling interval
             time.sleep(15)
-    log.info("Terminating.")
+        log.info(f"BlueSkyBot {self.handle} Terminating.")
 
     def handle_command(self, sender_did, text):
         try:
-            if not text.startswith("/"):
+            if not text.strip().startswith("/"):
                 return False
-            words = text.split(" ")
+            words = text.strip().split(" ")
             if   words[0] == "/help":     self.handle_help_command(sender_did)
-            elif words[0] == "/shutdown": self.queue.put(ShutdownMsg())
+            elif words[0] == "/shutdown": self.handle_shutdown_command(sender_did, words[1:])
             elif words[0] == "/who":      self.handle_who_command(sender_did)
-            elif words[0] == "/who-is":   self.handle_whois_command(words[1:], sender_did)
-            elif words[0] == "/mute":     self.handle_mute_command(words[1:], sender_did)
+            elif words[0] == "/who-is":   self.handle_whois_command(sender_did, words[1:])
+            elif words[0] == "/mute":     self.handle_mute_command(sender_did, words[1:])
             elif words[0] == "/muted":    self.handle_muted_command(sender_did)
             else:
                 self.tell_one_user(sender_did, "Admin command not understood.")
@@ -166,12 +175,33 @@ class BlueSkyBot(Thread):
             sender_did, 
             # Indentation designed to look good in BlueSky web interface
             f"""Admin commands:
-/help                    List admin commands
-/who                    List users in this Echo chamber
-/who-is <user>  Show details about <user>
-/mute <did>       Mute user with id <did>
-/muted                List muted users
-/shutdown          Shut down Echo chamber server""")
+/help
+              List admin commands
+/who
+              List users in this Echochamber
+/who-is <user>  
+              Show details about <user>
+/mute <did>
+              Mute user with id <did>
+/muted
+              List muted users
+/shutdown <app_password>
+              Shut down this Echochamber""")
+
+    def handle_shutdown_command(self, sender_did, words):
+        if words and words[0] == self.password:
+            self.tell_one_user(
+                sender_did, 
+                f"Echochamber: Shutdown accepted"
+            )
+            del BlueSkyBot.running_bots[self.handle]
+            self.queue.put(ShutdownMsg(self.handle))
+            self.stop = True
+        else:
+            self.tell_one_user(
+                sender_did, 
+                f"Echochamber: Shutdown not authorized"
+            )
 
     def handle_who_command(self, sender_did):
         self.update_followers()
@@ -183,20 +213,20 @@ class BlueSkyBot(Thread):
         if len(self.followers) >= 3:
             self.tell_one_user(
                 sender_did, 
-                f"There are {len(self.followers)-1} other members in this Echo chamber: {other_follower_names}"
+                f"Echochamber: There are {len(self.followers)-1} other members here: {other_follower_names}"
             )
         elif len(self.followers) == 2:
             self.tell_one_user(
                 sender_did, 
-                f"There is one other member in this Echo chamber: {other_follower_names}"
+                f"Echochamber: There is one other member here: {other_follower_names}"
             )
         else:
             self.tell_one_user(
                 sender_did, 
-                f"There are no other members in this Echo chamber."
+                f"Echochamber: There are no other members here."
             )
 
-    def handle_whois_command(self, words, sender_did):
+    def handle_whois_command(self, sender_did, words):
         count_matching_users = 0
         for follower in self.followers.values():
             for word in words:
@@ -208,26 +238,26 @@ class BlueSkyBot(Thread):
         if not count_matching_users:
             self.tell_one_user(sender_did, f"No matching users found.")
 
-    def show_user_details(self, follower, sender_did):
-        self.tell_one_user(
-            sender_did, 
-            f"{follower.display_name} ({follower.handle}) {follower.did}"
-        )
+    def show_user_details(self, sender_did, *followers):
+        for follower in followers:
+            self.tell_one_user(
+                sender_did, 
+                f"{follower.display_name} ({follower.handle}) {follower.did}"
+            )
 
     def handle_muted_command(self, sender_did):
         self.tell_one_user(sender_did, f"""Muted users: {", ".join(self.muted_users)}""")
 
-    def handle_mute_command(self, target_dids, sender_did):
+    def handle_mute_command(self, sender_did, *target_dids):
         for target_did in target_dids:
             self.mute_user(target_did, sender_did)
         self.handle_muted_command(sender_did)
 
     def tell_room_users(self, sender_did, rich_message):
-        self.update_followers()
         if sender_did in self.muted_users:
             log.info(f"Muted user {sender_did} is trying to post. Rejected.")
             return
-        from_name = self.get_follower_name(sender_did, f"Anonymous {sender_did}")
+        from_name = self.get_follower_name(sender_did)
         for member_did in self.followers:
             if member_did == sender_did:
                 continue
@@ -236,14 +266,33 @@ class BlueSkyBot(Thread):
             self.recompose(message_builder, rich_message)
             self.tell_one_user(member_did, message_builder)
 
-    def get_follower_name(self, did, default_name = None):
-        return self.get_follower_names().get(did, default_name)
+    def get_follower_name(self, did):
+        if did == self.did:
+            return "Echochamber"
+        return self.get_follower_names().get(did, f"Anonymous {did}")
 
-    def get_follower_names(self):
-        return {f.did: f.display_name if f.display_name else f.handle for f in self.followers.values()}
+    def get_follower_names(self, follower_dict = None):
+        if not follower_dict:
+            follower_dict = self.followers
+        return {f.did: f.display_name if f.display_name else f.handle for f in follower_dict.values()}
 
     def update_followers(self):
         self.followers = {follower.did:follower for follower in self.list_followers()}
+
+    def tell_room_about_follower_changes(self):        
+        announce_text = ""
+        new_follows = set(self.followers) - set(self.communicated_followers)
+        new_unfollows = set(self.communicated_followers) - set(self.followers)
+        if new_follows:
+            announce_text += ", ".join([self.get_follower_name(did) for did in self.followers.keys()]) + " joined the conversation. "
+        if new_unfollows:
+            announce_text += ", ".join([self.get_follower_name(did) for did in self.followers.keys()]) + " left."
+        if self.communicated_followers and (new_follows or new_unfollows):
+            # If there are no communicated_followers, the server was likely restarted
+            # No need to mention anything
+            self.tell_room_users(self.did, announce_text)
+        if new_follows or new_unfollows:
+            self.communicated_followers = self.followers.copy()
 
     def inform_about_followers(self):
         self.update_followers()
@@ -321,6 +370,10 @@ class BlueSkyBot(Thread):
 
     def recompose(self, message_builder, rich_message):
         log.info(f"Recompose {rich_message}")
+        if isinstance(rich_message, str):
+            message_builder.text(rich_message)
+            return
+
         # facets = [Main(features=[Link(uri='https://8.8.8.8/foo', py_type='app.bsky.richtext.facet#link')])]
         byte_str  = bytearray(rich_message.text, encoding="utf-8")
         byte_offs = 0
