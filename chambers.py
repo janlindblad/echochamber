@@ -39,6 +39,15 @@ class Chambers:
         os.unlink(Chambers.make_chamber_file_path(handle))
 
     @staticmethod
-    def create(chamber_name, username, password, hostname, handle):
-        #Check if exists
-        pass
+    def create(handle, username, password, hostname):
+        if handle in Chambers.get_definitions():
+            raise Exception(f"Chamber {handle} already exists")
+        chamber_filename = Chambers.make_chamber_file_path(handle)
+        with open(chamber_filename, "w") as f:
+            log.info(f"Writing {chamber_filename}")
+            json_text = json.dumps({
+                "username": username,
+                "app_password": password,
+                "hostname": hostname
+            })
+            f.write(json_text)

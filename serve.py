@@ -82,8 +82,12 @@ def handle_admin_msgs(queue):
         if isinstance(msg, ShutdownMsg):
             Chambers.delete(msg.handle)
         if isinstance(msg, StartupMsg):
-            Chambers.create(msg)        
-
+            try:
+                Chambers.create(msg.handle, msg.username, msg.password, msg.hostname)        
+                BlueSkyBot(queue, msg.handle, msg.username, msg.password, msg.hostname).start()
+            except Exception as e:
+                log.exception(f"Could not create echochamber {msg.handle}, skipping", exc_info=e)
+    
 def main():
     setup_logging()
     log.info(f"\n\n### Echochamber starting on {time.ctime()}")

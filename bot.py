@@ -9,7 +9,7 @@ from threading import Thread, get_ident
 from atproto import Client, models, IdResolver, client_utils
 import atproto_client.exceptions
 import atproto_client, atproto_server
-from msgs import ShutdownMsg
+from msgs import ShutdownMsg, StartupMsg
 
 # FIXME
 # patched ...python.../site-packages/atproto_client/models/chat/bsky/convo/get_log.py
@@ -130,7 +130,13 @@ class BlueSkyBot(Thread):
                     #log.info(f"Event details {event.__dict__}")
                     self.update_followers()
                     continue
-                elif event.message.sender.did == self.did:
+                elif isinstance(event, atproto_client.models.chat.bsky.convo.defs.LogAcceptConvo):
+                    # When someone follows?
+                    continue
+                elif not hasattr(event, "message"):
+                    log.debug(f"Received and ignored event: {event} {type(event)}")
+                    continue
+                if event.message.sender.did == self.did:
                     log.debug(f"Echo of own message {event.message.sender.did}: {event.message.text}")
                     continue
                 if event.message.text.strip().startswith("/"):
@@ -156,8 +162,9 @@ class BlueSkyBot(Thread):
             if not text.strip().startswith("/"):
                 return False
             words = text.strip().split(" ")
-            if   words[0] == "/help":     self.handle_help_command(sender_did)
+            if   words[0] == "/help":     self.handle_help_command(sender_did, words[1:])
             elif words[0] == "/shutdown": self.handle_shutdown_command(sender_did, words[1:])
+            elif words[0] == "/startup":  self.handle_startup_command(sender_did, words[1:])
             elif words[0] == "/who":      self.handle_who_command(sender_did)
             elif words[0] == "/who-is":   self.handle_whois_command(sender_did, words[1:])
             elif words[0] == "/mute":     self.handle_mute_command(sender_did, words[1:])
@@ -170,23 +177,47 @@ class BlueSkyBot(Thread):
             self.tell_one_user(sender_did, f"Admin command failed.")
             return True
 
-    def handle_help_command(self, sender_did):
-        self.tell_one_user(
-            sender_did, 
-            # Indentation designed to look good in BlueSky web interface
-            f"""Admin commands:
-/help
-              List admin commands
+    def handle_help_command(self, sender_did, words):
+        if not words:
+            self.tell_one_user(
+                sender_did, 
+                f"""Admin commands:
+/help [<command>]
+        List admin commands,
+        or show help for a specific command
 /who
-              List users in this Echochamber
+        List users in this Echochamber
 /who-is <user>  
-              Show details about <user>
-/mute <did>
-              Mute user with id <did>
+        Show details about <user>
+/mute <app_password> <did>
+        Mute user with id <did>
 /muted
-              List muted users
+        List muted users
 /shutdown <app_password>
-              Shut down this Echochamber""")
+        Shut down this Echochamber
+/startup <handle> <username> <app_password> [<hostname>]
+        Startup new Echochamber (on same bsky host, if not specified)""")
+            return
+        cmd = words[0].strip()
+        if cmd.startswith('/'): cmd = cmd[1:]
+        resp = f"Unknown command, '{cmd}'."
+        if cmd == "help": 
+            resp = """/help   List the admin commands.\n/help <command>   Explain the specific admin command."""
+        elif cmd == "who":
+            resp = """/who   List the users that will receive the messages you type in this Echochamber chat."""
+        elif cmd == "who-is":
+            resp = """/who-is <user>   Show details about the user or users that match the user name or id given."""
+        elif cmd == "mute":
+            resp = """/mute <app_password> <did>   Permanently expel the user with the given id from this and all other Echocambers hosted by this server. To do this, the app_password for thie Echochamber needs to be provided."""
+        elif cmd == "muted":
+            resp = """/muted   List muted users. Muted users are expelled and not able to communicate with the Echochamber."""
+        elif cmd == "shutdown":
+            resp = """/shutdown <app_password>   Shutdown this Echochamber. The BlueSky account will remain, but no echoing will happen. To do this, the app_password for thie Echochamber needs to be provided."""
+        elif cmd == "startup":
+            resp = """/startup <handle> <username> <app_password> [<hostname>]   Start a new Echochamber. The BlueSky account needs to already exist, and its handle, login username and app_password have to be specified. If hostname is given, that BlueSky host will be contacted. If not, the same BlueSky host as this Echochamber is running on will be assumed."""
+        else:
+            pass
+        self.tell_one_user(sender_did, resp)
 
     def handle_shutdown_command(self, sender_did, words):
         if words and words[0] == self.password:
@@ -202,6 +233,26 @@ class BlueSkyBot(Thread):
                 sender_did, 
                 f"Echochamber: Shutdown not authorized"
             )
+
+    def handle_startup_command(self, sender_did, words):
+        # /startup <handle> <username> <app_password> [<hostname>]
+        if len(words) < 3:
+            self.tell_one_user(
+                sender_did, 
+                f"Echochamber: Startup command missing information, Echochamber not started"
+            )
+        handle = words.pop(0)
+        username = words.pop(0)
+        app_password = words.pop(0)
+        if words:
+            hostname = words.pop(0)
+        else:
+            hostname = self.hostname
+        self.queue.put(StartupMsg(handle, username, app_password, hostname))
+        self.tell_one_user(
+            sender_did, 
+            f"Echochamber: Startup of Echochamber {handle} requested"
+        )
 
     def handle_who_command(self, sender_did):
         self.update_followers()
@@ -248,10 +299,21 @@ class BlueSkyBot(Thread):
     def handle_muted_command(self, sender_did):
         self.tell_one_user(sender_did, f"""Muted users: {", ".join(self.muted_users)}""")
 
-    def handle_mute_command(self, sender_did, *target_dids):
-        for target_did in target_dids:
-            self.mute_user(target_did, sender_did)
-        self.handle_muted_command(sender_did)
+    def handle_mute_command(self, sender_did, words):
+        if not words:
+            self.handle_muted_command(sender_did)
+            return
+        app_password = words[0]
+        target_dids = words[1:]
+        if app_password == self.password:
+            for target_did in target_dids:
+                self.mute_user(target_did, sender_did)
+            self.handle_muted_command(sender_did)
+        else:
+            self.tell_one_user(
+                sender_did, 
+                f"Echochamber: Muting not authorized"
+            )
 
     def tell_room_users(self, sender_did, rich_message):
         if sender_did in self.muted_users:
